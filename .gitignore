@@ -1,0 +1,7 @@
+# Never upload your real secrets
+secrets.yaml
+# ESPHome build output
+.esphome/
+# macOS system files
+.DS_Store
+__MACOSX/
