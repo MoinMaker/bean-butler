@@ -1,0 +1,55 @@
+# Bean Butler – Home Assistant automation "Bean Butler follows the coffee machine" (optional)
+#
+# Machine turns on  -> display on, channel open (unless "Remote coffee" is running – then it must keep diverting).
+# Machine turns off -> display off. Also after 60 min of "unknown" (with delonghi_coffeelink, "unknown"
+# only means the cloud reports nothing at the moment – it is NOT "off" by itself).
+#
+# How to add: Settings -> Automations & Scenes -> Create automation -> "Edit in YAML", paste, adjust "CHANGE".
+# script.remote_coffee is the entity ID of the "Remote coffee" script – check it after saving the script.
+
+alias: Bean Butler follows the coffee machine
+description: Display on/off with the machine; channel open when the machine is switched on by hand.
+mode: queued
+triggers:
+  - trigger: state
+    entity_id: sensor.coffee_machine_status        # CHANGE
+    not_from: [waking_up, ready]
+    to: [waking_up, ready]
+    id: "on"
+  - trigger: state
+    entity_id: sensor.coffee_machine_status        # CHANGE
+    to: [going_to_sleep, standby]
+    id: "off"
+  - trigger: state
+    entity_id: sensor.coffee_machine_status        # CHANGE
+    to: unknown
+    for:
+      minutes: 60
+    id: "off"
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: "on"
+        sequence:
+          - alias: Display on
+            action: light.turn_on
+            target:
+              entity_id: light.bean_butler_display_brightness
+          - alias: Channel open – unless Remote coffee is running
+            if:
+              - condition: state
+                entity_id: script.remote_coffee
+                state: "off"
+            then:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.bean_butler_divert_rinse
+      - conditions:
+          - condition: trigger
+            id: "off"
+        sequence:
+          - alias: Display off
+            action: light.turn_off
+            target:
+              entity_id: light.bean_butler_display_brightness

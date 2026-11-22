@@ -1,0 +1,312 @@
+# Bean Butler – ESPHome firmware
+# Rinse diverter for coffee machines that rinse through the spout at power-on.
+#
+# Board:  ESP32-2432S028 by Guition, version V1.3 ("Cheap Yellow Display", 2.8")
+# Servo:  MG90S (metal gears) on connector CN1, signal IO27
+# Power:  5 V / min. 3 A supply on P1 (VIN/GND) and in parallel to the servo,
+#         470 uF + 1000 uF capacitors close to the servo.
+#         The board's USB port is only for the first flash – never connect USB and the supply at the same time.
+# Mount:  board sits in the desk with the USB side facing UP -> image and touch rotated by 180 degrees.
+#
+# Before you flash:
+#   1. Put the three GIFs (waving.gif, sleeping.gif, rinsing.gif) into a folder "bean-butler/"
+#      next to this file (in Home Assistant: /config/esphome/bean-butler/).
+#   2. Add the secrets below to your ESPHome secrets.yaml (see secrets.example.yaml).
+#   3. Change the entity IDs under "substitutions" to the entities of YOUR coffee machine.
+#      The status values (ready / waking_up / going_to_sleep / standby) are the ones the
+#      De'Longhi Coffee Link integration (delonghi_coffeelink) reports. Other integrations
+#      may use different values – adjust them in the display lambda and the interval below.
+
+substitutions:
+  name: bean-butler
+  friendly: Bean Butler
+  # --- Entities of your coffee machine in Home Assistant (CHANGE THESE) ---
+  machine_status: sensor.coffee_machine_status              # ready / waking_up / going_to_sleep / standby
+  machine_drinks_total: sensor.coffee_machine_total_drinks  # optional: shown as coffee counter
+  machine_tank_empty: binary_sensor.coffee_machine_water_tank_empty
+  machine_grounds_full: binary_sensor.coffee_machine_grounds_container_full
+  machine_descale: binary_sensor.coffee_machine_descaling_required
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly}
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: channel_open        # default: channel swung forward, spouts free
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+api:
+  encryption:
+    key: !secret bean_butler_api_key
+ota:
+  - platform: esphome
+    password: !secret bean_butler_ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# ---------------- Servo, backlight, RGB LED ----------------
+output:
+  - platform: ledc
+    id: servo_pwm
+    pin: GPIO27
+    frequency: 50 Hz
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO21
+  - platform: ledc
+    id: led_r
+    pin: GPIO4
+    inverted: true
+  - platform: ledc
+    id: led_g
+    pin: GPIO16
+    inverted: true
+  - platform: ledc
+    id: led_b
+    pin: GPIO17
+    inverted: true
+
+servo:
+  - id: channel_servo
+    output: servo_pwm
+    auto_detach_time: 0s        # no auto-detach; both scripts cut servo power themselves 2 s after each swing
+                                # (the MG90S metal gears hold the arm, holding permanently makes it hum)
+    transition_length: 12s      # time for the FULL range (-100..100 %); a normal swing takes about 1.3 s
+
+# Servo angles, adjustable in Home Assistant (servo level -100..100 % = 0..180 degrees, 1 % = approx. 0.9 degrees).
+# Higher % = channel moves back towards the machine, lower % = forward.
+# Values that work on the original build: divert 46 %, open 20 %.
+# Don't go much higher than needed for "divert" – if the servo hums, the channel is pushing against something.
+number:
+  - platform: template
+    id: angle_divert
+    name: "Channel angle divert"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 45
+    min_value: -100
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+  - platform: template
+    id: angle_open
+    name: "Channel angle open"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_value: 20           # approx. 20 degrees forward
+    min_value: -100
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+
+globals:
+  - id: machine_state              # last real machine status; unknown/unavailable = integration reports nothing right now -> ignored
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: diverting
+    type: bool
+    initial_value: "false"
+
+script:
+  - id: channel_divert
+    mode: restart
+    then:
+      - servo.write:
+          id: channel_servo
+          level: !lambda "return id(angle_divert).state / 100.0;"
+      - lambda: "id(diverting) = true;"
+      - component.update: lcd
+      - delay: 2s                  # wait for the swing, then cut servo power
+      - if:
+          condition:
+            lambda: "return id(diverting);"
+          then:
+            - servo.detach: channel_servo
+  - id: channel_open
+    mode: restart
+    then:
+      - servo.write:
+          id: channel_servo
+          level: !lambda "return id(angle_open).state / 100.0;"
+      - lambda: "id(diverting) = false;"
+      - component.update: lcd
+      - delay: 2s
+      - if:
+          condition:
+            lambda: "return !id(diverting);"
+          then:
+            - servo.detach: channel_servo
+
+switch:
+  - platform: template
+    name: "Divert rinse"           # on = channel under the spouts, off = channel open
+    icon: mdi:water-sync
+    lambda: "return id(diverting);"
+    turn_on_action:
+      - script.execute: channel_divert
+    turn_off_action:
+      - script.execute: channel_open
+
+# ---------------- Status LED and display brightness ----------------
+light:
+  - platform: rgb
+    name: "Status light"
+    red: led_r
+    green: led_g
+    blue: led_b
+  - platform: monochromatic
+    id: backlight
+    name: "Display brightness"
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+
+# ---------------- Values from Home Assistant ----------------
+text_sensor:
+  - platform: version
+    name: "Firmware"
+    entity_category: diagnostic
+  - platform: homeassistant
+    id: machine_status_ha
+    entity_id: ${machine_status}
+    on_value:
+      - lambda: |-
+          if (x != "unknown" && x != "unavailable" && !x.empty()) id(machine_state) = x;
+      - component.update: lcd
+
+sensor:
+  - platform: homeassistant
+    id: drinks_total
+    entity_id: ${machine_drinks_total}
+  - platform: adc                     # light sensor (LDR) on the board
+    id: ambient_light
+    pin: GPIO34
+    attenuation: 12db
+    update_interval: 10s
+
+binary_sensor:
+  - platform: homeassistant
+    id: tank_empty
+    entity_id: ${machine_tank_empty}
+  - platform: homeassistant
+    id: grounds_full
+    entity_id: ${machine_grounds_full}
+  - platform: homeassistant
+    id: descale
+    entity_id: ${machine_descale}
+
+# ---------------- Display + touch ----------------
+spi:
+  - id: lcd_spi               # NO miso_pin – workaround for the white-screen issue of CYD boards with ESPHome 2026.x
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+  - id: touch_spi
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+font:
+  - file: "gfonts://Roboto"
+    id: f_large
+    size: 28
+    glyphs: &glyphs " !?%:.,-+()/'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  - file: "gfonts://Roboto"
+    id: f_small
+    size: 16
+    glyphs: *glyphs
+
+color:
+  - id: c_bg
+    hex: 1A1410                # dark coffee brown, same as the animation background
+  - id: c_title
+    hex: C8956A
+  - id: c_text
+    hex: E8DCCB
+  - id: c_red
+    hex: E24B4A
+
+# The bean in the bowler hat (put the GIFs into /config/esphome/bean-butler/)
+animation:
+  - file: "bean-butler/waving.gif"
+    id: ani_waving
+    type: RGB565
+  - file: "bean-butler/sleeping.gif"
+    id: ani_sleeping
+    type: RGB565
+  - file: "bean-butler/rinsing.gif"
+    id: ani_rinsing
+    type: RGB565
+
+interval:
+  - interval: 220ms
+    then:
+      - lambda: |-
+          std::string st = id(machine_state);
+          if (st == "waking_up" || st == "going_to_sleep") id(ani_rinsing).next_frame();
+          else if (st == "standby") { static int n = 0; if (++n % 3 == 0) id(ani_sleeping).next_frame(); }
+          else id(ani_waving).next_frame();
+      - component.update: lcd
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    spi_id: lcd_spi
+    model: ILI9341
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    data_rate: 20MHz
+    invert_colors: false
+    auto_clear_enabled: true
+    rotation: 180              # board mounted with the USB side facing UP
+    update_interval: never     # triggered by the interval above
+    lambda: |-
+      it.fill(id(c_bg));
+      it.print(120, 8, id(f_large), id(c_title), TextAlign::TOP_CENTER, "Bean Butler");
+      std::string st = id(machine_state);
+      // the machine rinses at power-on AND power-off
+      if (st == "waking_up" || st == "going_to_sleep") it.image(60, 46, id(ani_rinsing));
+      else if (st == "standby")   it.image(60, 46, id(ani_sleeping));
+      else                        it.image(60, 46, id(ani_waving));
+      std::string txt = "Waiting for status";
+      if (st == "ready") txt = "Ready";
+      else if (st == "standby") txt = "Sleeping";
+      else if (st == "waking_up") txt = "Rinsing";
+      else if (st == "going_to_sleep") txt = "Shutting down";
+      else if (!st.empty()) txt = st;
+      it.print(120, 204, id(f_small), id(c_text), TextAlign::TOP_CENTER, txt.c_str());
+      it.printf(120, 226, id(f_small), id(c_text), TextAlign::TOP_CENTER, "Channel: %s", id(diverting) ? "divert" : "open");
+      if (id(drinks_total).has_state())
+        it.printf(120, 250, id(f_small), id(c_title), TextAlign::TOP_CENTER, "%.0f coffees", id(drinks_total).state);
+      int y = 276;
+      if (id(tank_empty).state)        { it.print(120, y, id(f_small), id(c_red), TextAlign::TOP_CENTER, "Water tank empty"); y += 20; }
+      else if (id(grounds_full).state) { it.print(120, y, id(f_small), id(c_red), TextAlign::TOP_CENTER, "Empty grounds"); y += 20; }
+      else if (id(descale).state)      { it.print(120, y, id(f_small), id(c_red), TextAlign::TOP_CENTER, "Descale"); y += 20; }
+
+touchscreen:
+  - platform: xpt2046
+    spi_id: touch_spi
+    display: lcd
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    calibration:               # CYD defaults; touch only toggles the channel, position doesn't matter
+      x_min: 280
+      x_max: 3860
+      y_min: 340
+      y_max: 3860
+    on_touch:
+      - if:
+          condition:
+            lambda: "return id(diverting);"
+          then:
+            - script.execute: channel_open
+          else:
+            - script.execute: channel_divert

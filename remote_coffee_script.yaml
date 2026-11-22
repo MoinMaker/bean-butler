@@ -1,0 +1,143 @@
+# Bean Butler – Home Assistant script "Remote coffee"
+#
+# Makes a normal coffee even if the cup is already under the spout.
+# - Machine already ready -> coffee right away.
+# - Otherwise: channel to "divert" -> machine on -> wait for the rinse -> channel "open" -> coffee.
+#
+# Why a fixed wait time? The rinse duration varies (we measured 57 to 77+ s) and the machine
+# reports "ready" BEFORE the rinse has finished. So the script waits a fixed time (100 s)
+# AND for "ready". Adjust the delay to your machine.
+#
+# How to add: Settings -> Automations & Scenes -> Scripts -> Add script -> "Edit in YAML",
+# paste this, then replace the entity IDs marked with "CHANGE".
+#
+# Entities used:
+#   switch.bean_butler_divert_rinse                  (from the Bean Butler, created by ESPHome)
+#   sensor.coffee_machine_status                      CHANGE: ready / waking_up / going_to_sleep / standby
+#   button.coffee_machine_power_on                    CHANGE
+#   button.coffee_machine_coffee                      CHANGE (with delonghi_coffeelink: make this drink once
+#                                                     in the official Coffee Link app first, otherwise the
+#                                                     machine ignores the command)
+#   binary_sensor.coffee_machine_water_tank_empty     CHANGE (optional pre-checks)
+#   binary_sensor.coffee_machine_grounds_container_full
+#   binary_sensor.coffee_machine_filter_change_required
+
+alias: Remote coffee
+description: >-
+  Makes a normal coffee with the cup already in place. If the machine is off,
+  the Bean Butler diverts the power-on rinse first.
+icon: mdi:coffee
+mode: single
+fields:
+  notify_target:
+    name: Notify
+    description: Optional notify entity for status messages (e.g. your phone). Empty = no messages.
+    required: false
+    selector:
+      entity:
+        domain: notify
+sequence:
+  - alias: Pre-check – water tank empty, grounds full or filter change due -> stop
+    if:
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: binary_sensor.coffee_machine_water_tank_empty
+            state: "on"
+          - condition: state
+            entity_id: binary_sensor.coffee_machine_grounds_container_full
+            state: "on"
+          - condition: state
+            entity_id: binary_sensor.coffee_machine_filter_change_required
+            state: "on"
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ notify_target is defined and notify_target }}"
+        then:
+          - action: notify.send_message
+            target:
+              entity_id: "{{ notify_target }}"
+            data:
+              title: "☕ No coffee"
+              message: >-
+                {{ 'Water tank is empty.' if is_state('binary_sensor.coffee_machine_water_tank_empty', 'on')
+                   else ('Grounds container is full.' if is_state('binary_sensor.coffee_machine_grounds_container_full', 'on')
+                   else 'Water filter needs to be changed.') }}
+      - stop: Water tank empty, grounds full or filter change due
+
+  - alias: Machine not ready -> divert the rinse, power on, wait
+    if:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: sensor.coffee_machine_status
+            state: ready
+    then:
+      - alias: Channel back (divert)
+        action: switch.turn_on
+        target:
+          entity_id: switch.bean_butler_divert_rinse
+      - delay:
+          seconds: 2
+      - alias: Power on the machine
+        action: button.press
+        target:
+          entity_id: button.coffee_machine_power_on
+      - alias: Wait for the first fresh status update (max. 60 s)
+        wait_for_trigger:
+          - trigger: state
+            entity_id: sensor.coffee_machine_status
+            to: [ready, waking_up, standby, going_to_sleep]
+        timeout:
+          seconds: 60
+        continue_on_timeout: true
+      - alias: Was it already on? Otherwise wait for the rinse
+        if:
+          - condition: template
+            value_template: "{{ wait.trigger is none or wait.trigger.to_state.state != 'ready' }}"
+        then:
+          - alias: Fixed wait for the rinse (adjust to your machine)
+            delay:
+              seconds: 100
+          - alias: Wait for ready (max. 3 min)
+            wait_template: "{{ is_state('sensor.coffee_machine_status', 'ready') }}"
+            timeout:
+              minutes: 3
+          - if:
+              - condition: template
+                value_template: "{{ not wait.completed }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ notify_target is defined and notify_target }}"
+                then:
+                  - action: notify.send_message
+                    target:
+                      entity_id: "{{ notify_target }}"
+                    data:
+                      title: "☕ No coffee"
+                      message: The machine didn't report "ready" after almost 5 minutes. The channel stays in divert position.
+              - stop: No ready after timeout
+                error: true
+
+  - alias: Channel forward (open)
+    action: switch.turn_off
+    target:
+      entity_id: switch.bean_butler_divert_rinse
+  - delay:
+      seconds: 2
+  - alias: Start a normal coffee
+    action: button.press
+    target:
+      entity_id: button.coffee_machine_coffee
+  - if:
+      - condition: template
+        value_template: "{{ notify_target is defined and notify_target }}"
+    then:
+      - action: notify.send_message
+        target:
+          entity_id: "{{ notify_target }}"
+        data:
+          title: "☕ Coffee is brewing"
+          message: Your coffee is being made.
